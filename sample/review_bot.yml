@@ -1,0 +1,129 @@
+# Sample GitHub Actions workflow for automated code review with agent-reviewer.
+#
+# Copy this file into another repository as:
+#   .github/workflows/review_bot.yml
+#
+# Prerequisites:
+#   - The target repository should contain review guidance in one of:
+#     AGENT_REVIEWER.md, AGENTS.md, .github/copilot-instructions.md, GEMINI.md, CLAUDE.md
+#
+# Customize the env block if you fork agent-reviewer or use a different branch.
+
+name: Agent Reviewer Bot
+
+on:
+  pull_request:
+    types:
+      - opened
+      - ready_for_review
+      - synchronize
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: agent-reviewer-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # agent-reviewer source (checked out into ./agent-reviewer/)
+  AGENT_REVIEWER_REPO: terasakisatoshi/agent-reviewer-ollama
+  AGENT_REVIEWER_REF: feature/ollama-support
+  # Ollama endpoint used by agent-reviewer.ollama.toml when base_url is not set in the config file.
+  OLLAMA_HOST: http://127.0.0.1:11434
+  # Model pulled before review; must match agent-reviewer.ollama.toml.
+  OLLAMA_MODEL: qwen2.5-coder:7b
+  RUST_LOG: info
+
+jobs:
+  review:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout pull request branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Check out the PR head branch so git branch tools and GitHub PR lookup work.
+          ref: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout agent-reviewer
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ env.AGENT_REVIEWER_REPO }}
+          ref: ${{ env.AGENT_REVIEWER_REF }}
+          path: agent-reviewer
+          persist-credentials: false
+
+      - name: Install Ollama
+        shell: bash
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          for attempt in $(seq 1 60); do
+            if curl -sf "${OLLAMA_HOST}/"; then
+              break
+            fi
+            sleep 2
+          done
+          curl -sf "${OLLAMA_HOST}/" || (cat /tmp/ollama.log && exit 1)
+          ollama pull "${OLLAMA_MODEL}"
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache agent-reviewer build
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            agent-reviewer/target
+            agent-reviewer/.cargo
+          key: ${{ runner.os }}-agent-reviewer-${{ env.AGENT_REVIEWER_REF }}-${{ hashFiles('agent-reviewer/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-agent-reviewer-${{ env.AGENT_REVIEWER_REF }}-
+            ${{ runner.os }}-agent-reviewer-
+
+      - name: Build agent-reviewer
+        shell: bash
+        working-directory: agent-reviewer
+        run: cargo build --release
+
+      - name: Run code review
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./agent-reviewer/target/release/agent-reviewer \
+            --config ./agent-reviewer/agent-reviewer.ollama.toml \
+            --output review.md \
+            --allow-output-fallback-to-stdout \
+            "Review pull request #${{ github.event.pull_request.number || 'manual' }} in ${{ github.repository }}."
+
+      - name: Post review comment
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body-file review.md
+
+      - name: Upload review artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-reviewer-report-${{ github.event.pull_request.number || github.run_id }}
+          path: review.md
+          if-no-files-found: error
