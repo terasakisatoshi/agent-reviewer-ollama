@@ -14,12 +14,14 @@
 
 pub mod builder;
 mod concurrency;
+mod text_tool_calls;
 pub mod tools;
 
 use agent_reviewer_tools::CompoundAgentTools;
 pub use concurrency::ConcurrencyLimiter;
 use genai::Client;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest, MessageContent, ToolCall};
+use text_tool_calls::extract_text_tool_calls;
 use tracing::{debug, info};
 
 pub struct ReActAgent {
@@ -86,6 +88,52 @@ impl ReActAgent {
         format!("You are in step {} of {}.", current, self.max_loop_count)
     }
 
+    async fn try_recover_marker(
+        &self,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let mut recovery_messages = messages.to_vec();
+        recovery_messages.push(ChatMessage::user(format!(
+            "This is the final recovery step. You MUST call `{}` now. \
+             Respond with ONLY a JSON object shaped like \
+             {{\"name\":\"{}\",\"arguments\":{{...}}}} using the context gathered so far.",
+            self.submit_tool_name, self.submit_tool_name
+        )));
+
+        let request = ChatRequest {
+            system: Some(system_prompt.to_string()),
+            messages: recovery_messages,
+            tools: Some(
+                self.tools
+                    .get_tool_description_by_name(&self.submit_tool_name)
+                    .into_iter()
+                    .collect(),
+            ),
+            previous_response_id: None,
+            store: Some(false),
+        };
+
+        let response = {
+            let _permit = self.concurrency_limiter.acquire().await?;
+            self.client
+                .exec_chat(&self.model_name, request, self.options.as_ref())
+                .await?
+        };
+
+        let mut tool_calls: Vec<ToolCall> = response.content.tool_calls().into_iter().cloned().collect();
+        if tool_calls.is_empty()
+            && let Some(text) = response.first_text()
+        {
+            tool_calls = extract_text_tool_calls(text);
+        }
+
+        Ok(tool_calls
+            .iter()
+            .find(|call| call.fn_name == self.submit_tool_name)
+            .map(|call| call.fn_arguments.clone()))
+    }
+
     pub async fn run(
         &self,
         system_prompt: &str,
@@ -125,11 +173,29 @@ impl ReActAgent {
             };
             debug!("Model response: {:?}", response);
 
-            messages.push(ChatMessage::assistant(response.content.clone()));
+            let structured_tool_calls = !response.content.tool_calls().is_empty();
+            let mut tool_calls: Vec<ToolCall> =
+                response.content.tool_calls().into_iter().cloned().collect();
+            if tool_calls.is_empty()
+                && let Some(text) = response.first_text()
+            {
+                tool_calls = extract_text_tool_calls(text);
+                if !tool_calls.is_empty() {
+                    debug!("Recovered {} tool call(s) from text content", tool_calls.len());
+                }
+            }
 
+            let assistant_message = if !tool_calls.is_empty() && !structured_tool_calls {
+                ChatMessage::assistant(MessageContent::from_tool_calls(tool_calls.clone()))
+            } else {
+                ChatMessage::assistant(response.content.clone())
+            };
+            messages.push(assistant_message);
+
+            let tool_call_refs: Vec<&ToolCall> = tool_calls.iter().collect();
             let (markers, non_markers) = self
                 .tools
-                .separate_marker_and_non_marker(response.content.tool_calls());
+                .separate_marker_and_non_marker(tool_call_refs);
             if let Some(call) = markers
                 .iter()
                 .find(|call| call.fn_name == self.submit_tool_name)
@@ -137,6 +203,14 @@ impl ReActAgent {
                 debug!("Marker tool call: {:?}", call);
                 return Ok(call.fn_arguments.clone());
             }
+
+            if is_last_turn {
+                if let Some(args) = self.try_recover_marker(system_prompt, &messages).await? {
+                    debug!("Recovered marker arguments on final recovery step");
+                    return Ok(args);
+                }
+            }
+
             messages.push(self.tools.run_all_non_markers(non_markers).await);
         }
         anyhow::bail!("Exceeded max loop count")

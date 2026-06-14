@@ -73,6 +73,16 @@ impl ProviderBuilder {
                         .unwrap_or_else(|| "GITHUB_TOKEN".to_string()),
                 ),
             ),
+            ModelProviderContent::Ollama { base_url } => (
+                Some(
+                    base_url
+                        .clone()
+                        .map(Endpoint::from_owned)
+                        .unwrap_or_else(|| Endpoint::from_static("http://localhost:11434/")),
+                ),
+                AdapterKind::Ollama,
+                AuthData::from_single("ollama"),
+            ),
             ModelProviderContent::Bedrock {
                 access_key_env,
                 secret_access_key_env,

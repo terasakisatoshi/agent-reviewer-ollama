@@ -57,4 +57,7 @@ pub(crate) enum ModelProviderContent {
         access_key_env: Option<String>,
         secret_access_key_env: Option<String>,
     },
+    Ollama {
+        base_url: Option<String>,
+    },
 }

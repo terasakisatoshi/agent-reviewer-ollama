@@ -1,0 +1,43 @@
+# Local Ollama config for M4 Mac (24 GB). Use with:
+#   RUST_LOG=info cargo run --release -- --config agent-reviewer.ollama.toml --output review.md
+concurrency = 1
+
+[[model_providers]]
+id = "ollama"
+type = "Ollama"
+# base_url = "http://localhost:11434/"  # optional override
+
+[[models]]
+id = "coder-7b"
+model = "qwen2.5-coder:7b"
+provider = "ollama"
+
+[[agents]]
+id = "light"
+model = "coder-7b"
+max_tokens = 8192
+max_loops = 10
+
+[[agents]]
+id = "standard"
+model = "coder-7b"
+max_tokens = 8192
+max_loops = 10
+
+[[agents]]
+id = "power"
+model = "coder-7b"
+max_tokens = 8192
+max_loops = 10
+
+[steps]
+triage = { agent = "light" }
+review = {
+    light = { main_agent = "light" },
+    standard = { main_agent = "standard" },
+    power = { main_agent = "power" },
+}
+finalize = { agent = "power" }
+
+[subagent.explorer]
+agent = "light"
